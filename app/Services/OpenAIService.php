@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\Log;
 
 class OpenAIService
 {
-    public function processMessage(string $message, array $context = []): array
+    public function processMessage(string $message, array $context = [], int $retries = 2): array
     {
         try {
             $systemPrompt = $this->getSystemPrompt();
@@ -15,7 +15,6 @@ class OpenAIService
                 ['role' => 'system', 'content' => $systemPrompt],
             ];
 
-            // Adicionar contexto se houver
             if (!empty($context)) {
                 $messages[] = [
                     'role' => 'system',
@@ -25,30 +24,72 @@ class OpenAIService
 
             $messages[] = ['role' => 'user', 'content' => $message];
 
-            $response = OpenAI::chat()->create([
-                'model' => 'gpt-4o-mini',
-                'messages' => $messages,
-                'tools' => $this->getTools(),
-                'tool_choice' => 'auto',
-                'temperature' => 0.7,
-            ]);
+            $attempt = 0;
+            $response = null;
+            
+            while ($attempt <= $retries) {
+                try {
+                    $response = OpenAI::chat()->create([
+                        'model' => 'gpt-4o-mini',
+                        'messages' => $messages,
+                        'tools' => $this->getTools(),
+                        'tool_choice' => 'auto',
+                        'temperature' => 0.7,
+                    ]);
+                    
+                    break;
+                } catch (\Exception $e) {
+                    if (str_contains($e->getMessage(), 'rate limit') && $attempt < $retries) {
+                        $waitTime = pow(2, $attempt) * 2;
+                        Log::warning("Rate limit atingido, aguardando {$waitTime}s antes de tentar novamente...", [
+                            'attempt' => $attempt + 1,
+                            'max_retries' => $retries,
+                        ]);
+                        sleep($waitTime);
+                        $attempt++;
+                        continue;
+                    }
+                    
+                    throw $e;
+                }
+            }
+
+            if (!$response) {
+                throw new \Exception('Não foi possível obter resposta da OpenAI após múltiplas tentativas.');
+            }
 
             $messageResponse = $response->choices[0]->message;
 
-            // Se a IA chamou uma função
             if (!empty($messageResponse->toolCalls)) {
                 $toolCall = $messageResponse->toolCalls[0];
                 $functionName = $toolCall->function->name;
                 $arguments = json_decode($toolCall->function->arguments, true);
 
+                $textResponse = $messageResponse->content;
+                if (empty($textResponse) && $functionName === 'create_task') {
+                    $taskName = $arguments['task_name'] ?? 'tarefa';
+                    $frequency = $arguments['frequency'] ?? 'diária';
+                    $time = $arguments['time'] ?? null;
+                    $duration = $arguments['duration'] ?? null;
+                    
+                    $textResponse = "✅ Entendi! Vou criar sua tarefa: {$taskName}";
+                    if ($duration) {
+                        $textResponse .= " ({$duration})";
+                    }
+                    $textResponse .= " - Frequência: " . $this->getFrequencyLabel($frequency);
+                    if ($time) {
+                        $textResponse .= " às {$time}";
+                    }
+                    $textResponse .= ".";
+                }
+
                 return [
                     'intent' => $functionName,
                     'data' => $arguments,
-                    'text_response' => $messageResponse->content,
+                    'text_response' => $textResponse,
                 ];
             }
 
-            // Se a IA apenas respondeu texto
             return [
                 'intent' => 'text_response',
                 'data' => [],
@@ -60,28 +101,56 @@ class OpenAIService
                 'trace' => $e->getTraceAsString(),
             ]);
 
+            $errorMessage = 'Desculpe, ocorreu um erro ao processar sua mensagem.';
+            
+            if (str_contains($e->getMessage(), 'rate limit')) {
+                $errorMessage = '⚠️ Limite de requisições atingido. Por favor, aguarde alguns minutos e tente novamente. (Contas gratuitas têm limites menores)';
+            } elseif (str_contains($e->getMessage(), 'API Key')) {
+                $errorMessage = '❌ Erro de configuração da API. Verifique as credenciais.';
+            } elseif (str_contains($e->getMessage(), 'insufficient_quota')) {
+                $errorMessage = '💳 Créditos insuficientes na conta OpenAI. Verifique seu saldo.';
+            }
+
             return [
                 'intent' => 'error',
                 'data' => [],
-                'text_response' => 'Desculpe, ocorreu um erro ao processar sua mensagem.',
+                'text_response' => $errorMessage,
+                'error_details' => config('app.debug') ? $e->getMessage() : null,
             ];
         }
     }
 
+    private function getFrequencyLabel(string $frequency): string
+    {
+        return match ($frequency) {
+            'daily' => 'diária',
+            'weekly' => 'semanal',
+            'monthly' => 'mensal',
+            'once' => 'única vez',
+            default => $frequency,
+        };
+    }
+
     private function getSystemPrompt(): string
     {
-        return "Você é o Tuk, um assistente de tarefas amigável e prestativo no Telegram.
+        return "Você é o Tuk, um assistente de tarefas amigável e prestativo.
 
 Sua função é ajudar os usuários a criar e gerenciar tarefas através de conversas naturais.
 
-Quando o usuário mencionar uma tarefa, você deve:
-1. Extrair informações como nome da tarefa, frequência (diária, semanal, mensal), horário de lembrete e duração
-2. Usar a função create_task para criar a tarefa
-3. Responder de forma amigável e confirmar os detalhes
+IMPORTANTE: Sempre que o usuário mencionar uma tarefa (mesmo que faltem alguns detalhes), você DEVE usar a função create_task para extrair as informações disponíveis.
 
-Se o usuário perguntar sobre horários ou precisar de mais informações, faça perguntas claras e objetivas.
+Regras:
+1. Se o usuário mencionar uma tarefa, SEMPRE chame create_task com as informações que você conseguiu extrair
+2. Se faltar horário, use null para 'time' - você pode perguntar depois
+3. Se faltar duração, tente inferir ou use null
+4. Frequência padrão é 'daily' se não especificado
+5. Depois de chamar a função, responda de forma amigável confirmando o que foi entendido e perguntando o que falta
 
-Seja sempre educado, breve e útil. Use emojis ocasionalmente para tornar a conversa mais amigável.";
+Exemplos:
+- 'Ler 30 minutos por dia' → create_task com name='Ler livro', frequency='daily', duration='30m', time=null
+- 'Fazer exercícios às 7h' → create_task com name='Fazer exercícios', frequency='daily', time='07:00'
+
+Seja sempre educado, breve e útil. Use emojis ocasionalmente.";
 
     }
 
