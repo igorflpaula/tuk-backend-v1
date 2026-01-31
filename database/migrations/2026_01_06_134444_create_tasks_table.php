@@ -13,7 +13,7 @@ return new class extends Migration
     {
         Schema::create('tasks', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('telegram_user_id')->constrained('telegram_users')->onDelete('cascade');
+            $table->foreignId('telegram_user_id')->nullable()->constrained('telegram_users')->onDelete('cascade');
             $table->string('name');
             $table->text('description')->nullable();
             $table->enum('frequency', ['daily', 'weekly', 'monthly', 'once'])->default('daily');

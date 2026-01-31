@@ -10,6 +10,7 @@ class Task extends Model
 {
     protected $fillable = [
         'telegram_user_id',
+        'user_id',
         'name',
         'description',
         'frequency',
@@ -32,6 +33,11 @@ class Task extends Model
     public function telegramUser(): BelongsTo
     {
         return $this->belongsTo(TelegramUser::class);
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
     }
 
     public function calculateNextReminder(): void
